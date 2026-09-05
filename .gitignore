@@ -1,0 +1,36 @@
+# Node modules
+node_modules/
+npm-debug.log
+yarn-error.log
+
+# Build output
+dist/
+build/
+
+# Environment variables
+.env
+
+# Local scraper resume state
+/data/
+
+# Prisma
+prisma/migrations/
+*.db
+*.db-journal
+src/generated/
+
+# Logs
+logs
+*.log
+npm-debug.log*
+
+# OS Files
+.DS_Store
+Thumbs.db
+# Ignore compiled TypeScript outputs and temporary JS artifacts
+/src/**/*.js
+/src/**/*.js.map
+/tmp/*.js
+/tmp/*.js.map
+/tmp/*.d.ts
+/tmp/*.d.ts.map

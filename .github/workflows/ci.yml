@@ -1,0 +1,87 @@
+name: CI
+
+on:
+  push:
+    branches: [main, master]
+  pull_request:
+
+jobs:
+  build:
+    runs-on: ubuntu-latest
+    env:
+      OPENAI_API_KEY: dummy_ci_key
+    steps:
+      - uses: actions/checkout@v4
+
+      - uses: actions/setup-node@v4
+        with:
+          node-version: '22'
+          cache: npm
+
+      - name: Install dependencies
+        run: npm ci
+        env:
+          PLAYWRIGHT_SKIP_BROWSER_DOWNLOAD: '1'
+
+      - name: Generate Prisma client
+        run: npx prisma generate
+
+      - name: Typecheck
+        run: npx tsc --noEmit
+
+      - name: Unit checks (schedule / stripe tiers / matching)
+        run: npm test
+
+      - name: Verify catalog parity + model aliases
+        run: npm run verify:catalogs
+
+      - name: Verify engine-detection heuristics (regression guard)
+        run: npm run verify:engines
+
+      - name: Validate docker-compose
+        run: |
+          touch .env
+          docker compose config --quiet
+        env:
+          POSTGRES_USER: ci
+          POSTGRES_PASSWORD: ci
+          POSTGRES_DB: ci
+          REDIS_PASSWORD: ci
+          NPM_NETWORK: bridge
+
+  # Optional post-merge gate — enable when a deploy secret + VPS SSH is ready.
+  # Soft-launch CD recommendation: keep this manual or require `workflow_dispatch`
+  # until v1 is stable; auto-deploy on every push is riskier than a green CI gate.
+  # deploy:
+  #   needs: build
+  #   if: github.ref == 'refs/heads/main' && github.event_name == 'push'
+  #   runs-on: ubuntu-latest
+  #   steps:
+  #     - name: Deploy via SSH (example)
+  #       run: echo "Wire SSH + docker compose up --build after CI is green"
+
+  secret-scan:
+    runs-on: ubuntu-latest
+    steps:
+      - uses: actions/checkout@v4
+        with:
+          fetch-depth: 0
+
+      - name: Fail if a real .env is committed
+        run: |
+          if git ls-files --error-unmatch .env >/dev/null 2>&1; then
+            echo "::error::.env is tracked by git — remove it and rotate every secret."
+            exit 1
+          fi
+
+      - name: Grep for obvious credential shapes
+        run: |
+          set +e
+          PATTERN='(sk_live_[A-Za-z0-9]{10,}|sk-[A-Za-z0-9_-]{30,}|whsec_[A-Za-z0-9]{10,}|[0-9]{8,10}:[A-Za-z0-9_-]{30,})'
+          MATCHES=$(git grep -InE "$PATTERN" -- . ':!*.md' ':!package-lock.json' ':!.github/workflows/ci.yml')
+          if [ -n "$MATCHES" ]; then
+            echo "::error::Possible secret committed:"
+            echo "$MATCHES"
+            exit 1
+          fi
+          echo "No credential-shaped strings found."

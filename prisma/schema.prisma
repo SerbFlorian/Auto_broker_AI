@@ -1,0 +1,169 @@
+generator client {
+  provider = "prisma-client-js"
+  output   = "../src/generated/prisma"
+}
+
+datasource db {
+  provider = "postgresql"
+  url      = env("DATABASE_URL")
+}
+
+model User {
+  id                  String   @id @default(uuid())
+  telegramId          BigInt   @unique
+  subscriptionStatus  String   @default("free") // free, vip, cancelling
+  stripeCustomerId    String?  @unique
+  freeSearchesUsed    Int      @default(0) // Límite max: 3
+  freeAiQuestionsUsed Int      @default(0) // Límite max: 1
+  dailyAiRequests     Int      @default(0)
+  weeklyAiRequests    Int      @default(0)
+  /// VIP: times a Listing found link was attached today (recover / broken-link; max AI_VIP_DB_LOOKUPS_MAX)
+  dailyAiDbLookups    Int      @default(0)
+  /// VIP: 1 free extra DB pull/day when user reports a dead Listing found (after normal lookups are spent)
+  dailyBrokenLinkGraceUsed Int @default(0)
+  lastAiRequestDate   DateTime?
+  /// Set when VIP → free (Stripe deleted). Cron purges PII after DATA_PURGE_HOURS.
+  becameFreeAt        DateTime?
+  /// Digest delivery: ISO weekdays 1=Mon … 7=Sun (Europe/Madrid). Empty → treated as all days.
+  digestDays          Int[]    @default([1, 2, 3, 4, 5, 6, 7])
+  /// Inclusive start hour (Europe/Madrid). Clamped to system hard floor (default 7).
+  digestStartHour     Int      @default(8)
+  /// Exclusive end hour (Europe/Madrid). Digests while start ≤ hour < end. Default 21.
+  digestEndHour       Int      @default(21)
+  /// Hours between digests: 1 | 2 | 3 | 4 (default 2).
+  digestIntervalH     Int      @default(2)
+  /// When true, digests are held (radar + queue kept).
+  digestPaused        Boolean  @default(false)
+  createdAt           DateTime @default(now())
+  updatedAt           DateTime @updatedAt
+
+  alerts              UserAlert[]
+  sentListings        SentListing[]
+}
+
+/// Tiny key/value store for operational state that must survive restarts
+/// (e.g. the admin VIP counter message id, so we edit instead of spamming).
+model AppMeta {
+  key       String   @id
+  value     String
+  updatedAt DateTime @updatedAt
+}
+
+model CarListing {
+  id                  String   @id @default(uuid())
+  sourcePortal        String   // Ej: mobile.de, autoscout24, etc.
+  portalId            String   @unique // ID único extraído del portal de origen
+  originalUrl         String   @unique // Canonical ad URL — prevents same-link duplicates
+  brand               String
+  model               String
+  brandNorm           String   @default("")
+  modelNorm           String   @default("")
+  version             String?
+  versionTokens       String[] @default([])
+  /// Canonical engine label from catalog / version parse (e.g. "1.4 TFSI")
+  engine              String?
+  /// Lowercase key for filters/indexes (e.g. "1.4 tfsi")
+  engineNorm          String   @default("")
+  year                Int
+  mileageKm           Int
+  /// Asking price in EUR (filters, digests, deal score). Non-EUR markets are converted by the FX job.
+  price               Float
+  /// Original scraped amount before FX (null = EUR-native or not yet converted).
+  priceNative         Float?
+  /// ISO currency of priceNative (e.g. SEK, PLN). "EUR" when the listing was already in euros.
+  priceCurrency       String   @default("EUR")
+  fuelType            String?
+  transmission        String?
+  /// Metric horsepower (CV / PS / ch). kW from portals is converted on ingest.
+  powerHp             Int?
+  sellerType          String?
+  countryOfOrigin     String   // Ej: DE, ES, IT
+  /// Set when originalUrl was HTTP-checked and still opens (null = pending verify job).
+  urlVerifiedAt       DateTime?
+  createdAt           DateTime @default(now())
+  updatedAt           DateTime @updatedAt
+
+  sentListings        SentListing[]
+
+  @@index([brandNorm, modelNorm])
+  @@index([brandNorm, modelNorm, fuelType])
+  @@index([brandNorm, modelNorm, year])
+  @@index([brandNorm, modelNorm, price])
+  @@index([brandNorm, modelNorm, mileageKm])
+  @@index([brandNorm, modelNorm, engineNorm])
+  @@index([brandNorm, modelNorm, powerHp])
+  @@index([engineNorm])
+  @@index([updatedAt])
+  @@index([countryOfOrigin, priceNative])
+  @@index([urlVerifiedAt])
+}
+
+model UserAlert {
+  id                  String   @id @default(uuid())
+  userId              String
+  user                User     @relation(fields: [userId], references: [id], onDelete: Cascade)
+  
+  // Filtros de búsqueda (JSON o campos específicos)
+  brand               String?
+  model               String?
+  brandNorm           String?
+  modelNorm           String?
+  minYear             Int?
+  maxMileageKm        Int?
+  maxPrice            Float?
+  countries           String[] @default([]) // ISO codes ES/DE/… (multi-select; vacío = Any)
+  fuelTypes           String[] // Combustibles seleccionados (multi-select; vacío = Any)
+  versions            String[] // Especificaciones/versión seleccionadas (soporta múltiples)
+  /// Selected engineNorm values (multi-select; vacío = Any)
+  engines             String[] @default([])
+  /// Minimum metric CV (powerHp); null = Any
+  minPowerHp          Int?
+  
+  rawQuery            String?  // Ej: "BMW M3, año > 2018, en Alemania, por debajo de 50.000€"
+  
+  createdAt           DateTime @default(now())
+  updatedAt           DateTime @updatedAt
+
+  @@index([brandNorm, modelNorm])
+}
+
+/// Precomputed filter stats — filter UX reads this, not live aggregates on CarListing.
+model InventoryStats {
+  id            String   @id @default(uuid())
+  brandNorm     String
+  modelNorm     String
+  /// Empty string = whole brand+model; otherwise a single version token.
+  versionToken  String   @default("")
+  count         Int
+  minPrice      Float
+  maxPrice      Float
+  avgPrice      Float
+  minYear       Int
+  maxYear       Int
+  avgYear       Float
+  minMileage    Int
+  maxMileage    Int
+  avgMileage    Float
+  fuels         String[] @default([])
+  /// Distinct engineNorm values seen for this slice (filter UX)
+  engines       String[] @default([])
+  minPower      Int      @default(0)
+  maxPower      Int      @default(0)
+  avgPower      Float    @default(0)
+  updatedAt     DateTime @updatedAt
+
+  @@unique([brandNorm, modelNorm, versionToken])
+  @@index([brandNorm, modelNorm])
+}
+
+model SentListing {
+  id          String     @id @default(uuid())
+  userId      String
+  carId       String
+  sentAt      DateTime   @default(now())
+  
+  user        User       @relation(fields: [userId], references: [id], onDelete: Cascade)
+  carListing  CarListing @relation(fields: [carId], references: [id], onDelete: Cascade)
+
+  @@unique([userId, carId])
+}

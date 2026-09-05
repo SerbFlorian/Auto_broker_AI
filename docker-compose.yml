@@ -1,0 +1,226 @@
+# ============================================
+# Auto Broker AI — Docker Compose
+# ============================================
+# app     → bot + Stripe webhook + digests + R2 backup (WORKER_MODE=app)
+# scraper → Playwright/HTTP ingest only (WORKER_MODE=scraper) — no Stripe/R2
+# DB/Redis → private Docker network (no host ports)
+# ============================================
+
+services:
+  app:
+    build:
+      context: .
+      args:
+        WORKER_TARGET: app
+    container_name: auto_broker_ai_app
+    restart: unless-stopped
+    user: "1000:1000"
+    ports:
+      - "127.0.0.1:3003:3003"
+    env_file:
+      - .env
+    environment:
+      DATABASE_URL: postgresql://${POSTGRES_USER}:${POSTGRES_PASSWORD}@postgresql:5432/${POSTGRES_DB}
+      REDIS_URL: redis://:${REDIS_PASSWORD}@redis:6379
+      WORKER_MODE: app
+      PORT: "3003"
+      TZ: Europe/Madrid
+      # Force product caps (override stale .env on VPS)
+      AI_VIP_DAILY_MAX: "40"
+      AI_VIP_WEEKLY_MAX: "280"
+      AI_VIP_DB_LOOKUPS_MAX: "3"
+      AI_FREE_SEARCHES_MAX: "3"
+      BACKFILL_NORMS: "true"
+      # Heal legacy rows with version text but empty versionTokens[] on boot
+      BACKFILL_VERSION_TOKENS: "true"
+    depends_on:
+      postgresql:
+        condition: service_healthy
+      redis:
+        condition: service_healthy
+    networks:
+      - internal
+      - npm_proxy
+    security_opt:
+      - no-new-privileges:true
+    cap_drop:
+      - ALL
+    tmpfs:
+      - /tmp:size=128M,mode=1777
+    healthcheck:
+      test:
+        [
+          'CMD-SHELL',
+          'node -e "fetch(\"http://127.0.0.1:3003/health\").then(r=>process.exit(r.ok?0:1)).catch(()=>process.exit(1))"'
+        ]
+      interval: 15s
+      timeout: 5s
+      retries: 10
+      start_period: 90s
+    deploy:
+      resources:
+        limits:
+          cpus: '0.40'
+          memory: 640M
+          pids: 256
+        reservations:
+          cpus: '0.10'
+          memory: 192M
+
+  scraper:
+    build:
+      context: .
+      args:
+        WORKER_TARGET: scraper
+    container_name: auto_broker_ai_scraper
+    restart: unless-stopped
+    user: "1000:1000"
+    # Skip migrate CMD — app owns schema sync
+    command: ['npx', 'tsx', 'src/index.ts']
+    # No env_file: only ingest secrets (no Stripe / R2 / payment links)
+    environment:
+      DATABASE_URL: postgresql://${POSTGRES_USER}:${POSTGRES_PASSWORD}@postgresql:5432/${POSTGRES_DB}
+      REDIS_URL: redis://:${REDIS_PASSWORD}@redis:6379
+      REDIS_PASSWORD: ${REDIS_PASSWORD}
+      WORKER_MODE: scraper
+      TZ: Europe/Madrid
+      # No TELEGRAM_BOT_TOKEN here on purpose: a scraper RCE must not be able to
+      # take over the bot. CRITICAL alerts go to the Redis relay (ops:critical)
+      # and the app container forwards them to the admin chat.
+      OPENAI_API_KEY: ${OPENAI_API_KEY}
+      BRIGHTDATA_ENABLED: ${BRIGHTDATA_ENABLED:-false}
+      PROXY_URL: ${PROXY_URL:-}
+      BRIGHTDATA_API_KEY: ${BRIGHTDATA_API_KEY:-}
+      BRIGHTDATA_ZONE: ${BRIGHTDATA_ZONE:-}
+      BRIGHTDATA_COUNTRY: ${BRIGHTDATA_COUNTRY:-es}
+      PLAYWRIGHT_BROWSERS_PATH: /app/.playwright
+      ADMIN_ALERT_COOLDOWN_MS: ${ADMIN_ALERT_COOLDOWN_MS:-900000}
+      DATA_PURGE_HOURS: ${DATA_PURGE_HOURS:-48}
+      SCRAPER_ENABLE_MANUAL_TEST: ${SCRAPER_ENABLE_MANUAL_TEST:-false}
+      OY_PAGES_PER_RUN: ${OY_PAGES_PER_RUN:-5}
+      CLICARS_PAGES_PER_RUN: ${CLICARS_PAGES_PER_RUN:-5}
+      TP_PAGES_PER_RUN: ${TP_PAGES_PER_RUN:-2}
+      TP_MAX_DETAILS_PER_PAGE: ${TP_MAX_DETAILS_PER_PAGE:-4}
+      SCRAPER_FAST_CRON: ${SCRAPER_FAST_CRON:-0 8,12,16,20 * * 1-5}
+      SCRAPER_SLOW_CRON: ${SCRAPER_SLOW_CRON:-0 10,16 * * 1-5}
+      BRIGHT_DATA_DAILY_MAX: ${BRIGHT_DATA_DAILY_MAX:-11}
+      SCRAPER_PROXY_DAILY_MAX: ${SCRAPER_PROXY_DAILY_MAX:-4}
+      BRIGHT_DATA_SLOW_RETRY: ${BRIGHT_DATA_SLOW_RETRY:-false}
+    depends_on:
+      postgresql:
+        condition: service_healthy
+      redis:
+        condition: service_healthy
+      app:
+        condition: service_healthy
+    networks:
+      - internal
+    security_opt:
+      - no-new-privileges:true
+    cap_drop:
+      - ALL
+    tmpfs:
+      - /tmp:size=256M,mode=1777
+    volumes:
+      - scraper_state:/app/data
+    deploy:
+      resources:
+        limits:
+          cpus: '0.55'
+          memory: 1100M
+          # Playwright forks browser + renderer processes; keep headroom but cap a fork bomb.
+          pids: 512
+        reservations:
+          cpus: '0.15'
+          memory: 256M
+
+  postgresql:
+    image: postgres:15-alpine
+    container_name: autobroker_db
+    restart: unless-stopped
+    environment:
+      POSTGRES_USER: ${POSTGRES_USER}
+      POSTGRES_PASSWORD: ${POSTGRES_PASSWORD}
+      POSTGRES_DB: ${POSTGRES_DB}
+    command:
+      - postgres
+      - -c
+      - shared_buffers=512MB
+      - -c
+      - effective_cache_size=1536MB
+      - -c
+      - work_mem=8MB
+      - -c
+      - maintenance_work_mem=128MB
+      - -c
+      - max_connections=80
+    volumes:
+      - pgdata:/var/lib/postgresql/data
+    networks:
+      - internal
+    security_opt:
+      - no-new-privileges:true
+    cap_drop:
+      - ALL
+    cap_add:
+      - CHOWN
+      - DAC_OVERRIDE
+      - FOWNER
+      - SETGID
+      - SETUID
+    healthcheck:
+      test: ['CMD-SHELL', 'pg_isready -U "$$POSTGRES_USER" -d "$$POSTGRES_DB"']
+      interval: 10s
+      timeout: 5s
+      retries: 10
+    deploy:
+      resources:
+        limits:
+          cpus: '0.90'
+          memory: 2560M
+          pids: 256
+        reservations:
+          cpus: '0.25'
+          memory: 512M
+
+  redis:
+    image: redis:7-alpine
+    container_name: autobroker_redis
+    restart: unless-stopped
+    environment:
+      REDIS_PASSWORD: ${REDIS_PASSWORD:?Set REDIS_PASSWORD in .env}
+    entrypoint: ['/bin/sh', '-c', 'exec redis-server --appendonly yes --maxmemory 384mb --maxmemory-policy allkeys-lru --requirepass "$$REDIS_PASSWORD"']
+    volumes:
+      - redisdata:/data
+    networks:
+      - internal
+    security_opt:
+      - no-new-privileges:true
+    # No cap_drop here: the custom entrypoint bypasses the image's su-exec, so
+    # redis-server runs as root and still needs DAC_OVERRIDE to write /data (owned by uid 999).
+    healthcheck:
+      test: ['CMD-SHELL', 'redis-cli -a "$$REDIS_PASSWORD" ping | grep PONG']
+      interval: 10s
+      timeout: 5s
+      retries: 10
+    deploy:
+      resources:
+        limits:
+          cpus: '0.25'
+          memory: 448M
+          pids: 128
+        reservations:
+          cpus: '0.05'
+          memory: 64M
+
+volumes:
+  pgdata:
+  redisdata:
+  scraper_state:
+
+networks:
+  internal:
+    driver: bridge
+  npm_proxy:
+    external: true
+    name: ${NPM_NETWORK:-nginx-proxy_default}
